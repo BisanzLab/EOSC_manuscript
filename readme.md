@@ -3,4 +3,4 @@
 Please find attached source files and code to recapitulate manuscript analyses. Please direct any questions to girmamulisa30@gmail.com and jordan.bisanz@psu.edu
 
 
-[Click here to be taken to knit markdownfile](https://bisanzlab.github.io/EOSC_manuscript/)
+[Click here to be taken to knit markdownfile](https://bisanzlab.com/EOSC_manuscript/)
