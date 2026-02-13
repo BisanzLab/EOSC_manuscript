@@ -1,0 +1,1928 @@
+---
+title: "Rural Ethiopians harbor a unique salivary microbiota associated with lower risk of esophageal cancer"
+author: Girma Mulisa, Jingcheng Zhao, Geda Lelissa, Iyunoluwa J. Ademola-Popoola, Anastacia Marie Diaz, Laura S. Weyrich, Adane Mihret, Tufa Gemechu, Abate Bane, Roger Pero-Gascon, Marthe De Boevre, Sarah De Saeger,  Tamrat Abebe, Jordan E. Bisanz
+date: '`r format(Sys.time(), "%Y-%m-%d %H:%M")`'
+output: 
+  html_document:
+    code_folding: show
+    theme: cerulean
+    number_sections: false
+    highlight: monochrome
+    fig_width: 7
+    fig_height: 4
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=F)
+```
+
+
+# Purpose
+
+1- Characterize health Ethiopian oral microbiota
+<br>2- Compare healthy Ethiopian oral microbiota to other geographic populations
+<br>3- Conduct cross sectional analysis of case and controls in Ethiopian cohort
+<br>4- Compare ability to predict cancer status in external cohorts
+
+# Experimental Methods
+
+Ethiopian data is V4 16S rRNA sequencing performed on NextSeq 2000 P1 600 cycle (not XLEAP). See https://github.com/BisanzLab/OHMC_Colaboratory for wet lab methods. DNA was extracted using the Zymobiomics Mag96 extractions and libraries prepaired using the OHMC amplicon library method.
+
+
+For QIIME2 processing script see `https://github.com/BisanzLab/OHMC_Colaboratory/blob/main/analysis_scripts/AmpliconSeq_q2.Rmd`.
+
+***
+
+# R Setup
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(qiime2R)
+library(vegan)
+library(ape)
+library(ggtree)
+library(ALDEx2)
+library(Biostrings)
+library(cluster)
+library(dada2)
+
+theme_set(theme_q2r()) # this will ensure that figures are stored with appropriate fonts/aesthetics
+sessionInfo()
+
+```
+
+
+***
+
+# Data Import
+
+Data was derived using v2.1 of script found here: https://github.com/BisanzLab/OHMC_Colaboratory/blob/main/analysis_scripts/AmpliconSeq_q2.Rmd.
+
+```{r}
+metadata<-read_excel("inputs/EOSC_metadata_2026Feb11.xlsx")
+asv_table<-readRDS("inputs/asv_table.RDS")
+asv_taxonomy<-readRDS("inputs/asv_taxonomy.RDS")
+asv_tree<-readRDS("inputs/asv_tree.RDS")
+```
+
+# Copies of raw data
+
+```{r}
+interactive_table(metadata)
+xfun::embed_file("inputs/asv_table.RDS")
+xfun::embed_file("inputs/asv_taxonomy.RDS")
+xfun::embed_file("inputs/asv_tree.RDS")
+```
+
+
+# QC
+
+First check negative and positive control read counts.
+
+```{r}
+asv_table[,subset(metadata, grepl("Control", SampleType))$SampleID] %>% colSums()
+```
+
+There are <1592 reads in negative controls vs >34,691 in positive zymo controls. Will check what is found in negative controls below.
+
+```{r}
+neg_contaminants<- asv_table[,subset(metadata, SampleType=="Negative Control")$SampleID] %>%
+  filter_features(1,1) %>% rownames()
+  
+  
+asv_table[,subset(metadata, SampleType=="Negative Control")$SampleID] %>%
+  filter_features(1,1) %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  left_join(asv_taxonomy %>% dplyr::select(-Sequence)) %>%
+  interactive_table()
+```
+
+All reads in extraction controls are tell-tale kit-ome of our current lot of reagents. To be safe, will use a 10,000 read threshold for successful sequencing.
+
+Will also look for consistent contaminants.
+
+```{r}
+asv_table[,subset(metadata, SampleType=="Negative Control")$SampleID] %>%
+  filter_features(1,1) %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  mutate_if(is.numeric, function(x) if_else(x>0,1,0)) %>%
+  UpSetR::upset(nsets = 10)
+```
+
+The two conserved contaminants appear to be the same E. coli and Bordetella previously observed in this reagent batch.
+
+Next will check composition of positive controls which are zymo community standard.
+
+```{r}
+pos_contaminants<-
+asv_table[,subset(metadata, SampleType=="Positive Control")$SampleID] %>%
+  filter_features(1,1) %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  left_join(asv_taxonomy %>% dplyr::select(-Sequence)) %>%
+  filter(!Genus %in% c("Bacillus","Enterococcus","Escherichia-Shigella","Limosilactobacillus","Pseudomonas","Salmonella","Staphylococcus","Listeria"))
+
+colSums(pos_contaminants[,2:5])
+colSums(pos_contaminants[,2:5]) %>% mean()
+colSums(pos_contaminants[,2:5]) %>% sd()
+```
+
+i.e. in positive controls these putative contaminants make up less than 43 reads per sample.
+
+```{r}
+asv_table[,subset(metadata, SampleType=="Positive Control")$SampleID] %>%
+  filter_features(1,1) %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  left_join(asv_taxonomy %>% dplyr::select(-Sequence)) %>%
+  interactive_table()
+```
+
+Single/double digit contaminants that are mix of background, and either seq errors or trace cross-contamination in extractions.
+
+```{r}
+pos_con<-
+asv_table[,subset(metadata, SampleType=="Positive Control")$SampleID] %>%
+  filter_features(1,1)
+  summarize_taxa(pos_con, asv_taxonomy %>% column_to_rownames("ASV"))$Species %>%
+  taxa_barplot()
+ggsave("figures/zymo_standard.pdf", height=4, width=8, useDingbats=F)
+rm(pos_con)
+```
+
+***
+
+# Data Cleanup
+
+Remove controls and filter for low read depth samples.
+
+```{r}
+asv_table_unfiltered<-asv_table # save for later
+metadata_unfiltered<-metadata
+asv_table<-asv_table[,colSums(asv_table)>10000]
+asv_table<-asv_table[,subset(metadata, SampleID %in% colnames(asv_table) & SampleType=="Saliva")$SampleID] %>% filter_features(1,1)
+metadata<-metadata %>% filter(SampleID %in% colnames(asv_table)) %>% mutate(Group=factor(Group, levels=c("Healthy","Diseased")))
+asv_table<-asv_table[,metadata$SampleID]
+asv_taxonomy<-asv_taxonomy %>% filter(ASV %in% rownames(asv_table))
+asv_tree<-keep.tip(asv_tree, rownames(asv_table))
+```
+
+Double check tree for odd topology / problematic features. Will root on Methanobrevibacteria for figures `c6cb8ffae3081efef011a521c8039722`.
+
+```{r}
+root(asv_tree, outgroup="c6cb8ffae3081efef011a521c8039722") %>%
+ggtree() %<+% asv_taxonomy +
+  geom_tippoint(aes(color=Phylum))
+
+ggsave("figures/tree.pdf", height=8, width=11.5, useDingbats=F)
+```
+
+Summary of sample breakdown between healthy and controls in final dataset:
+
+```{r}
+metadata %>% count(Group)
+```
+
+***
+
+# Table S1. Potential contaminants
+
+```{r}
+contaminant_reads<-
+asv_table_unfiltered[unique(c(pos_contaminants$ASV, neg_contaminants)),] %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  pivot_longer(!ASV, names_to = "SampleID", values_to = "Abundance") %>%
+  left_join(metadata_unfiltered) %>%
+  filter(SampleType!="Exclude") %>%
+  filter(SampleType %in% c("Negative Control","Positive Control") | SampleID %in% metadata$SampleID) %>% #resync tables
+  mutate(SampleType=case_when(Group=="Diseased"~"Case", Group=="Healthy"~"Control", TRUE~SampleType)) %>%
+  group_by(ASV, SampleType, Group) %>%
+  summarize_at("Abundance", lst(mean,median,min,max,sd, length)) %>%
+  mutate(stat=paste0(median," [",min,"-",max,"]")) %>%
+  arrange(desc(median)) %>%
+  dplyr::select(ASV, SampleType, stat) %>%
+  pivot_wider(names_from = "SampleType", values_from = "stat")
+
+contaminant_percent<-asv_table_unfiltered %>% make_percent()
+contaminant_percent<-
+  contaminant_percent[unique(c(pos_contaminants$ASV, neg_contaminants)),] %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  pivot_longer(!ASV, names_to = "SampleID", values_to = "Abundance") %>%
+  left_join(metadata_unfiltered) %>%
+  filter(SampleType!="Exclude") %>%
+  filter(SampleType %in% c("Negative Control","Positive Control") | SampleID %in% metadata$SampleID) %>% #resync tables
+  mutate(SampleType=case_when(Group=="Diseased"~"Case", Group=="Healthy"~"Control", TRUE~SampleType)) %>%
+  group_by(ASV, SampleType, Group) %>%
+  summarize_at("Abundance", lst(mean,median,min,max,sd, length)) %>%
+  mutate_if(is.numeric, function(x) signif(x, digits=3)) %>%
+  mutate(stat=paste0(median," [",min,"-",max,"]")) %>%
+  arrange(desc(median)) %>%
+  dplyr::select(ASV, SampleType, stat) %>%
+  pivot_wider(names_from = "SampleType", values_from = "stat")
+
+
+contaminant_reads %>%
+  full_join(contaminant_percent, by="ASV", suffix=c("_reads","_percent")) %>%
+  left_join(asv_taxonomy %>% dplyr::select(ASV, Kingdom, Family, Genus, Species)) %>%
+  interactive_table()
+
+```
+
+***
+
+
+# Table 1: Demographics
+
+```{r}
+metadata %>% group_by(Group) %>% summarize_at("Age", lst(mean,sd,median,min,max))
+wilcox.test(Age~Group, metadata)
+
+metadata %>% group_by(Sex, Group) %>% count()
+metadata %>% group_by(Sex, Group) %>% count() %>% pivot_wider(names_from = Group, values_from = n) %>% as.data.frame() %>% column_to_rownames("Sex") %>% fisher.test()
+
+metadata %>% group_by(Smoking, Group) %>% count()
+metadata %>% group_by(Smoking, Group) %>% count() %>% pivot_wider(names_from = Group, values_from = n, values_fill = 0) %>% as.data.frame() %>% column_to_rownames("Smoking") %>% fisher.test()
+
+metadata %>% group_by(`Chewing tobacco`, Group) %>% count()
+metadata %>% group_by(`Chewing tobacco`, Group) %>% count() %>% pivot_wider(names_from = Group, values_from = n, values_fill = 0) %>% as.data.frame() %>% column_to_rownames("Chewing tobacco") %>% fisher.test()
+
+metadata %>% group_by(`Alcohol Drink`, Group) %>% count()
+metadata %>% group_by(`Alcohol Drink`, Group) %>% count() %>% pivot_wider(names_from = Group, values_from = n, values_fill = 0) %>% as.data.frame() %>% column_to_rownames("Alcohol Drink") %>% fisher.test()
+
+metadata %>% group_by(`Khat use`, Group) %>% count()
+metadata %>% group_by(`Khat use`, Group) %>% count() %>% pivot_wider(names_from = Group, values_from = n, values_fill = 0) %>% as.data.frame() %>% column_to_rownames("Khat use") %>% fisher.test()
+
+metadata %>% group_by(`Coffee drinking`, Group) %>% count()
+metadata %>% group_by(`Coffee drinking`, Group) %>% count() %>% pivot_wider(names_from = Group, values_from = n, values_fill = 0) %>% as.data.frame() %>% column_to_rownames("Coffee drinking") %>% fisher.test()
+```
+
+
+***
+
+# Potential batch effects and impact of recruitment pairing.
+
+```{r}
+dists<- asv_table %>% filter_features(1,1) %>% make_clr() %>% t() %>% dist(., method="euclidean")
+
+mat <- as.matrix(dists)
+rownames(mat) <- colnames(mat)
+
+# Extract unique pairs (no diagonal, no duplicates)
+idx <- which(upper.tri(mat), arr.ind = TRUE)
+
+df <- data.frame(
+  sample1  = rownames(mat)[idx[,1]],
+  sample2  = colnames(mat)[idx[,2]],
+  distance = mat[idx]
+)
+
+df<-
+df %>%
+  as_tibble() %>%
+  arrange(sample1) %>%
+  left_join(metadata %>% dplyr::select(sample1=SampleID, Pair1=Pair)) %>%
+  left_join(metadata %>% dplyr::select(sample2=SampleID, Pair2=Pair)) %>%
+  mutate(PairType=if_else(Pair1==Pair2 & Pair1!="Unpaired", "Intra-Pair", "Inter-Pair"))
+  #filter(PairType=="Intra-Pair") %>%
+
+  
+df %>%
+  ggplot(aes(x=PairType, y=distance)) +
+  geom_boxplot()
+    
+df %>% t.test(distance~PairType, data=.)
+
+rm(dists, df, idx, mat)
+```
+
+Samples belonging to cases and the individual who accompanied them to the clinic are not significantly more similar than un-associated individuals.
+
+To examine batch effects we will only examine extraction plate as the remainder of the processing was performed on a single 384 well plate/sequencing run.
+
+```{r}
+metadata %>% group_by(Group, ExtractionPlate) %>% count() %>% pivot_wider(names_from = "Group", values_from = "n") # no discrepancies by extraction plate.
+```
+
+There is no evidence that controls vs cancer participants were unevenly distributed across plates.
+
+```{r}
+batchalpha<-
+  asv_table %>% subsample_table() %>% t() %>% picante::pd(., asv_tree) %>%
+  rownames_to_column("SampleID") %>%
+  dplyr::select(SampleID, PhylogeneticDiversity="PD", ASV_Richness="SR") %>%
+  full_join(
+    asv_table %>% subsample_table() %>% t() %>% diversity(., "shannon") %>% data.frame(ShannonDiversity=.) %>% rownames_to_column("SampleID")
+  ) %>%
+  inner_join(metadata) %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity")
+
+batchalpha %>% group_by(Metric) %>% do(aov(Diversity~ExtractionPlate, data=.) %>% broom::tidy()) %>% knitr::kable()
+  
+batchalpha %>% ggplot(aes(x=ExtractionPlate, y=Diversity, fill=ExtractionPlate)) + geom_boxplot() + facet_wrap(~Metric, scales="free") + theme(legend.position = "none")
+ggsave("manuscript_figures/batch_alpha.pdf", height=3, width=6, useDingbats=F)
+```
+
+No evidence of impact on diversity of communities. Will check community structure.
+
+```{r}
+batchdist<-
+summarize_taxa(asv_table, asv_taxonomy %>% column_to_rownames("ASV"))$Genus %>%
+  make_clr() %>%
+  t() %>%
+  dist(., method="euclidean")
+
+batchpc<-ape::pcoa(batchdist)
+
+batchpc$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(metadata) %>%
+    ggplot(aes(x=Axis.1, y=Axis.2, fill=ExtractionPlate)) +
+    geom_point(shape=21, color="grey50") +
+    theme(legend.position="bottom") +
+    xlab(paste0("PC1: ",round(batchpc$values$Relative_eig[1]*100,2),"%")) +
+    ylab(paste0("PC2: ",round(batchpc$values$Relative_eig[2]*100,2),"%"))
+
+adonis2(batchdist~metadata[match(labels(batchdist), metadata$SampleID),]$ExtractionPlate) %>% print()
+ggsave("manuscript_figures/batch_clr_euc.pdf", height=2.3, width=2, useDingbats=F)
+
+```
+
+```{r}
+rm(batchalpha, batchpc, batchdist)
+```
+***
+
+# Figure 1: Description of Healthy Oral Microbiome in Cohort
+
+
+```{r}
+fig1_meta<-metadata %>% filter(Group=="Healthy")
+fig1_asvs<-asv_table[,fig1_meta$SampleID] %>% filter_features(1,1)
+```
+
+## Figure 1AB. Alpha Diversity
+
+```{r}
+fig1_adiversity<-
+  fig1_asvs %>% subsample_table() %>% t() %>% picante::pd(., asv_tree) %>%
+  rownames_to_column("SampleID") %>%
+  dplyr::select(SampleID, PhylogeneticDiversity="PD", ASV_Richness="SR") %>%
+  full_join(
+    fig1_asvs %>% subsample_table() %>% t() %>% diversity(., "shannon") %>% data.frame(ShannonDiversity=.) %>% rownames_to_column("SampleID")
+  ) %>%
+  left_join(metadata)
+
+interactive_table(fig1_adiversity)
+
+fig1_adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  summarize_at("Diversity", lst(mean,median,sd,min,max)) %>%
+  interactive_table()
+
+fig1_adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  ggplot(aes(x=Diversity)) +
+  geom_freqpoly(bins=20) +
+  facet_wrap(~Metric, scales="free") +
+  ylab("# Healhy Participants") +
+  xlab("Alpha Diversity")
+
+ggsave("manuscript_figures/healthy_alpha_diversity.pdf", height=2, width=5, useDingbats=F)
+```
+
+## Figure 1C. Taxonomic Description
+
+```{r}
+fams<-summarize_taxa(fig1_asvs, asv_taxonomy %>% column_to_rownames("ASV"))$Family %>% make_percent()
+
+sample_order<-dist(t(fams)) %>%  hclust(method="average") # average is upgma %>% plot()
+sample_order<-sample_order$labels[sample_order$order]
+
+q2r_palette <- c("blue4", "olivedrab", "firebrick", "gold", 
+        "darkorchid", "steelblue2", "chartreuse1", "aquamarine", 
+        "yellow3", "coral", "grey")
+
+toplot<-rowMeans(fams) %>% sort(.,decreasing=TRUE) %>% names() %>% .[1:10]
+
+fams %>%
+  as.data.frame() %>%
+  rownames_to_column("Taxon") %>%
+  pivot_longer(!Taxon) %>%
+  mutate(TaxonGroup=if_else(Taxon %in% toplot, Taxon, "Other")) %>%
+  group_by(TaxonGroup, name) %>%
+  summarize(value=sum(value)) %>%
+  ungroup() %>%
+  mutate(name=factor(name, levels=sample_order)) %>%
+  mutate(TaxonGroup=factor(TaxonGroup, levels=rev(c(toplot,"Other")))) %>%
+  ggplot(aes(x=name, y=value, fill=TaxonGroup)) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=rev(q2r_palette), name="Family") +
+  coord_cartesian(ylim=c(0,100), expand = F) +
+  theme(axis.ticks.x = element_blank(), axis.text.x=element_blank()) +
+  xlab("Participant") +
+  ylab("% Abundance") +
+  theme(legend.text = element_text(size=3))
+
+ggsave("manuscript_figures/healthy_boxplot.pdf", height= 2, width=5)
+
+rm(fams, sample_order, toplot)
+```
+
+Alternate reviewer figure showing "average" healthy composition. Will use the compositional average/center.
+
+```{r}
+avgsamp<-
+summarize_taxa(fig1_asvs, asv_taxonomy %>% column_to_rownames("ASV"))$Family %>%
+  make_clr() %>%
+  apply(., 1, mean) %>%
+  data.frame(CLR=.) %>%
+  rownames_to_column("Family") %>%
+  mutate(Percent=2^CLR/sum(2^CLR)*100) %>%
+  arrange(desc(Percent)) %>%
+  top_n(10, Percent)
+
+avgsamp %>%
+  bind_rows(
+      tibble(Family="Other", CLR=NA, Percent=100-sum(avgsamp$Percent))
+  ) %>%
+  mutate(Family=factor(Family, levels=Family) )%>%
+  ggplot(aes(x=1, y=Percent, fill=Family)) +
+  geom_col(color="black") +
+  coord_polar(theta="y") +
+  theme_void() +
+  scale_fill_manual(values=q2r_palette)
+ggsave("manuscript_figures/healthy_pie.pdf", height= 2, width=10)
+  
+rm(avgsamp)
+```
+
+## Figure 1D. Clusters
+
+In healthy groups check for sub structure/community state types using PAM with validation by gap statistic. Using genus abundances here to reduce dimensionality and for later compatibility.
+
+```{r}
+fig1_asvs<-summarize_taxa(fig1_asvs, asv_taxonomy %>% column_to_rownames("ASV"))$Genus
+
+dists<-list()
+  dists$`CLR Euclidean`<-fig1_asvs %>% make_clr() %>% t() %>% dist(., method="euclidean")
+
+pcos<-lapply(dists, ape::pcoa)
+```
+
+
+```{r}
+Metric="CLR Euclidean"
+do_pam<-function(distmat, Nclusters){list(cluster = pam(distmat,Nclusters, cluster.only=TRUE))}
+gapstats<-clusGap(pcos[[Metric]]$vectors, FUN=do_pam, K.max = 10, B=100) #maximum of 13 clusters (ie 2 per cluster)
+
+gapstats<-
+  gapstats$Tab %>%
+  as.data.frame() %>%
+  mutate(Nclusters=1:nrow(.)) %>%
+  dplyr::select(Nclusters, GapStatistic=gap, SE=SE.sim)
+
+ggplot(gapstats, aes(x=Nclusters, y=GapStatistic, ymin=GapStatistic-SE, ymax=GapStatistic+SE)) +
+  geom_errorbar(width=0) +
+  geom_point() +
+  scale_x_continuous(breaks=(1:10))
+ggsave("manuscript_figures/health_gapstat.pdf", height=2, width=2)
+
+clusters<-pam(dists[[Metric]], k=2, diss=TRUE, cluster.only = TRUE)
+clustered_metadata<-tibble(SampleID=names(clusters), Cluster=paste0("Cluster_", clusters))
+rm(clusters)
+```
+
+## Figure 1E. PCoA of Clusters
+
+```{r}
+lapply(names(pcos), function(x){
+    pcos[[x]]$values %>%
+      as.data.frame() %>%
+      mutate(Metric=x) %>%
+      mutate(Axis=1:nrow(.))
+  }) %>%
+  bind_rows() %>%
+  filter(Axis %in% 1:3) %>%
+  dplyr::select(Metric, Axis, everything()) %>%
+  interactive_table()
+
+
+pcos[[Metric]]$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(metadata) %>%
+    left_join(clustered_metadata) %>%
+    ggplot(aes(x=Axis.1, y=Axis.2, fill=Cluster)) +
+    geom_point(shape=21, color="grey50") +
+    theme(legend.position="bottom") +
+    xlab(paste0("PC1: ",round(pcos[[Metric]]$values$Relative_eig[1]*100,2),"%")) +
+    ylab(paste0("PC2: ",round(pcos[[Metric]]$values$Relative_eig[2]*100,2),"%")) +
+    scale_fill_manual(values=c("darkorange","purple4"))
+
+ggsave("manuscript_figures/healthy_clreuc.pdf", height=2.3, width=2, useDingbats=F)
+
+
+vegan::adonis2(dists[[Metric]]~Cluster, data=clustered_metadata[match(labels(dists[[Metric]]), clustered_metadata$SampleID),])
+
+clustered_metadata %>% count(Cluster)
+rm(Metric, gapstats)
+```
+
+
+## Figure 1F. Differential diversity between Clusters.
+
+```{r}
+fig1_adiversity %>%
+  left_join(clustered_metadata) %>%
+  ggplot(aes(x=Cluster, y=ShannonDiversity, fill=Cluster)) +
+  geom_boxplot() +
+  scale_fill_manual(values=c("darkorange","purple4")) +
+  theme(legend.position="none") +
+  coord_cartesian(ylim=c(2, 6))
+ggsave("manuscript_figures/healthy_clusters_diversity.pdf", height=2, width=1, useDingbats=F)
+
+fig1_adiversity %>%
+  left_join(clustered_metadata) %>%
+  t.test(ShannonDiversity~Cluster, data=.)
+```
+
+
+## Figure 1G. Differential abundance between clusters
+
+```{r}
+results<-
+fig1_asvs[,clustered_metadata$SampleID] %>%
+  filter_features(5,5) %>%
+  aldex(reads=., clustered_metadata$Cluster, include.sample.summary = TRUE)
+
+cleaned_results<-
+  results %>% filter(we.eBH<0.1 & abs(diff.btw)>1) %>%
+  arrange(diff.btw) %>%
+  rownames_to_column("ASV") %>%
+  dplyr::select(ASV, Cluster1_CLR=rab.win.Cluster_1, Cluster2=rab.win.Cluster_2, log2FC=diff.btw, Pvalue=we.ep, FDR=we.eBH) %>%
+  arrange(log2FC)
+
+interactive_table(cleaned_results)
+
+write_tsv(cleaned_results, "manuscript_figures/healthy_clusters_aldex.tsv")
+
+results %>%
+  rownames_to_column("Taxon") %>%
+  mutate(Label=if_else(Taxon %in% cleaned_results$ASV, Taxon,"")) %>%
+  mutate(fc=case_when(
+    Label!="" & diff.btw>0 ~ "Cluster 2",
+    Label!="" & diff.btw<0 ~ "Cluster 1",
+    TRUE ~ "ns"
+         )) %>%
+  mutate(Label=gsub("..+\\;","", Label)) %>%
+  ggplot(aes(y=-log10(we.ep), x=diff.btw, color=fc)) +
+  geom_point(shape=16, alpha=0.6) +
+  ggrepel::geom_text_repel(aes(label=Label), size=1.8) +
+  xlab("log2(fold change) Cluster 2 vs Cluster 1") +
+  ylab("-log10(P-value)") +
+  scale_color_manual(values=c("darkorange","purple4", "grey50")) +
+  theme(legend.position="none")
+
+ggsave("manuscript_figures/healthy_volcano_clusters.pdf", height=2, width=3.5, useDingbats=F)
+rm(results)
+```
+
+## Figure 1H. Differential absolute abundances between clusters.
+
+Derived using the V6 total dual-dye 16S qPCR and normalized based on a 1:1 dilution with preservative and 5mL of saliva.
+
+```{r}
+clustered_qpcr<-
+read_csv("EOSC_16S_qPCR.csv") %>%
+  dplyr::select(SampleID, Cq, `16S copies/mL`, `log10(16S copies/mL)`) %>%
+  filter(SampleID %in% clustered_metadata$SampleID) %>%
+  left_join(clustered_metadata)
+
+interactive_table(clustered_qpcr)
+
+clustered_qpcr %>%
+  group_by(Cluster) %>%
+  summarize_at("log10(16S copies/mL)", lst(mean,median,sd,min,max, length)) %>% knitr::kable()
+
+clustered_qpcr %>%
+  ggplot(aes(x=Cluster, y=`log10(16S copies/mL)`, fill=Cluster)) +
+  geom_boxplot() +
+  scale_fill_manual(values=c("darkorange","purple4")) +
+  theme(legend.position="none") +
+  coord_cartesian(ylim=c(3,10))
+
+ggsave("manuscript_figures/clustered_qPCR.pdf", height=2, width=1, useDingbats=F)
+
+t.test(`log10(16S copies/mL)`~Cluster, data=clustered_qpcr) %>% broom::tidy()
+```
+
+***
+
+# Figure S1. PICRUST
+
+```{bash eval=F, echo=T}
+tm<-asv_table %>% subsample_table()
+tm %>% biomformat::make_biom() %>% biomformat::write_biom("asv_table.biom")
+ta<-asv_taxonomy %>% filter(ASV %in% rownames(tm))
+fa<-DNAStringSet(ta$Sequence)
+names(fa)<-ta$ASV
+writeXStringSet(fa, "asv_seqs.fa")
+
+# see https://github.com/picrust/picrust2/wiki/Full-pipeline-script
+conda activate picrust2 # picrust 2.4.1
+picrust2_pipeline.py -s asv_seqs.fa -i asv_table.biom -o picrust2_out_strat -p 24 --stratified
+add_descriptions.py -i picrust2_out_strat/pathways_out/path_abun_unstrat.tsv.gz -m METACYC -o picrust2_out_strat/pathways_w_desc.tsv
+```
+
+```{r}
+picrust<-read_tsv("picrust2_out_strat/pathways_w_desc.tsv")[,c("pathway","description", colnames(fig1_asvs))]
+picrust<-picrust[rowSums(picrust[,3:ncol(picrust)])>0,]
+
+picrust<-
+picrust %>%
+  pivot_longer(!c(pathway, description), names_to = "SampleID", values_to = "Abundance") %>%
+  group_by(SampleID) %>%
+  mutate(Abundance=Abundance/sum(Abundance)) %>%
+  group_by(pathway, description) %>%
+  mutate(Abundance=log2(Abundance+(min_nonzero(Abundance)*(2/3)))) %>%
+  ungroup() %>%
+  left_join(clustered_metadata) %>%
+  mutate(Cluster=factor(Cluster, levels=c("Cluster_1","Cluster_2")))
+  
+
+
+picrust_results<-
+  picrust %>%
+  group_by(pathway, description) %>%
+  do(
+    t.test(Abundance~Cluster, data=.) %>%
+      broom::tidy()
+  ) %>%
+  ungroup()
+
+picrust_results<-
+picrust_results %>%
+  dplyr::rename(log2FC=estimate, Cluster1=estimate1, Cluster2=estimate2) %>%
+  mutate(FDR=p.adjust(p.value, method="BH"))
+
+interactive_table(picrust_results)
+
+picrust_results %>%
+  filter(FDR<0.1 & abs(log2FC)>1) %>%
+  arrange(desc(log2FC)) %>%
+  mutate(dir=if_else(Cluster1>Cluster2, "Cluster1", "Cluster2")) %>%
+  mutate(pathway=paste0(pathway, ": ", description)) %>%
+  mutate(pathway=factor(pathway, levels=rev(pathway))) %>%
+  ggplot(aes(x=pathway, y=log2FC, ymin=conf.low, ymax=conf.high, color=dir)) +
+  geom_hline(yintercept = 0, linetype="dashed", color="grey50") +
+  geom_errorbar(width=0) +
+  geom_point(size=1) +
+  coord_flip() +
+  scale_color_manual(values=c("darkorange","purple4")) +
+  theme(legend.position="none") +
+  theme(axis.text.y=element_text(size=5)) +
+  ylab("log2(fold change) (Cluster 1 vs Cluster 2") +
+  xlab("")
+ggsave("manuscript_figures/healthy_picrust_clusters.pdf", height=5, width=5, useDingbats=F)
+rm(picrust, picrust_results)
+```
+
+***
+
+# Figure 2. Comparison against International Cohorts.
+
+All Ethiopian data was reprocessed by Iyun for comparisons against the AGP and other cohorts which is described in Ademola-Popoola IJ, Abdul-Aziz MA, Ta CK, Barreiro LB, Perry G, Weyrich LS. Evolutionary Histories and Shared Environments Shape Oral Microbiomes in Ugandan Batwa and Bakiga Populations.
+
+```{r}
+comp_table<-read_qza("inputs/weyrich_asvtable.qza")$data
+dim(comp_table)
+colSums(comp_table) %>% summary()
+
+comp_table<-comp_table[,colSums(comp_table)>5000] %>% filter_features(1,1)
+dim(comp_table)
+colSums(comp_table) %>% summary()
+
+comp_meta<-read_tsv("inputs/weyrich_metadata.txt") %>% filter(sample_name %in% colnames(comp_table))
+comp_meta %>%  count(country)
+
+comp_seqs<-read_qza("weyrichdata/Global_merged_rep_seqs.qza")$data
+comp_seqs<-comp_seqs[rownames(comp_table)]
+
+comp_taxonomy<-readRDS("inputs/weyrich_taxonomy.RDS")
+
+comp_meta<-comp_meta %>% dplyr::select(SampleID=sample_name, Country=country)
+```
+
+## Figure 2A. Alpha Diversity with global cohort.
+
+```{r}
+comp_sub<-subsample_table(comp_table)
+
+comp_adiv<-comp_sub %>% t() %>% diversity(., "shannon") %>% data.frame(ShannonDiversity=.) %>% rownames_to_column("SampleID") %>% left_join(comp_meta)
+
+interactive_table(comp_adiv)
+
+comp_adiv %>%
+  group_by(Country) %>%
+  summarize_at("ShannonDiversity", lst(mean,median,sd,min,max)) %>%
+  interactive_table()
+
+comp_adiv %>%
+  ggplot(aes(x=Country, y=ShannonDiversity, fill=Country)) +
+  geom_boxplot() +
+  ylab("Shannon Diversity") +
+  xlab("Country") +
+  theme(legend.position="none") +
+  coord_cartesian(ylim=c(0, 7))
+
+ggsave("manuscript_figures/comp_alpha_diversity.pdf", height=2, width=2.2, useDingbats=F)
+
+fit<-comp_adiv %>% aov(ShannonDiversity~Country, data=.)
+summary(fit)
+TukeyHSD(fit) %>% broom::tidy() %>% interactive_table()
+```
+
+## Figure 2B. Beta Diversity with global cohort.
+
+```{r}
+comp_dist<-summarize_taxa(comp_table, as.data.frame(comp_taxonomy))$Genus %>% make_clr() %>% t() %>% dist(., method="euclidean")
+
+comp_pc<-pcoa(comp_dist)
+
+comp_pc$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(comp_meta) %>%
+  left_join(clustered_metadata %>% mutate(SampleID=gsub("_",".", SampleID))) %>%
+  mutate(Cluster=if_else(is.na(Cluster),"Other", Cluster)) %>%
+  #ggplot(aes(x=Axis.1, y=Axis.2, fill=Country)) +
+  ggplot(aes(x=Axis.1, y=Axis.2, fill=Country, shape=Cluster)) +
+  geom_point() +
+  #geom_point(shape=21) +
+  scale_shape_manual(values=c(24,25,21)) +
+  xlab(paste0("PC1: ",round(comp_pc$values$Relative_eig[1]*100,2),"%")) +
+  ylab(paste0("PC2: ",round(comp_pc$values$Relative_eig[2]*100,2),"%"))
+ggsave("manuscript_figures/comp_pcoa.pdf", height=2, width=3, useDingbats=F)
+
+vegan::adonis2(comp_dist~Country, data=comp_meta[match(labels(comp_dist), comp_meta$SampleID),])
+```
+
+***
+
+# Figure S2. Differentially abundant families between Ethiopia and other cohorts.
+
+```{r}
+comp_results<-list()
+for(f in unique(comp_meta$Country)){
+  if(f=="Ethiopia"){next}
+  message(f)
+  tm<-subset(comp_meta, Country %in% c(f,"Ethiopia")) %>% mutate(Country=if_else(Country=="Ethiopia", "z_Ethiopia", Country))
+  tf<-comp_table[,tm$SampleID] %>% filter_features(10,10)
+  tf<-summarize_taxa(tf, comp_taxonomy %>% as.data.frame())$Family
+  comp_results[[f]]<-aldex(reads=tf, conditions = tm$Country, mc.samples = 128) %>% rownames_to_column("Taxon") %>% mutate(Contrast=paste("Ethiopia vs", f))
+}
+
+rm(tm, tf)
+
+comp_results %>%
+  bind_rows() %>%
+  interactive_table()
+
+comp_results %>%
+  bind_rows() %>%
+  mutate(Sig=if_else(abs(diff.btw)>1 & we.eBH<0.1, "*","ns")) %>%
+  mutate(Label=if_else(Sig=="*", gsub("..+; ","", Taxon) %>% gsub("NA","", .), "")) %>%
+  mutate(Pval=we.ep+min_nonzero(we.ep))  %>% # to get these on the plot
+  ggplot(aes(x=diff.btw, y=-log10(Pval), color=Sig)) +
+  geom_point(shape=16, alpha=0.5) +
+  facet_wrap(~Contrast, ncol=2, scales="free") +
+  xlab("log2Fold Change (Ethiopia vs Cohort)") +
+  scale_color_manual(values=c("indianred","grey50")) +
+  ggrepel::geom_text_repel(aes(label=Label), size=2) +
+  theme(legend.position="none") +
+  ylab("-log10(P-value)")
+ggsave("manuscript_figures/comp_volcano.pdf", width=7, height=5, useDingbats=F)
+```
+
+
+***
+
+# Figure 3. Covariates of Ethipian microbiota structure
+
+## Table S2. Mycotoxins
+
+```{r}
+covariates<-
+  metadata %>%
+  left_join(read_excel("inputs/mycotoxins.xlsx")) %>%
+  dplyr::select(SampleID, 
+                Group, 
+                Sex, 
+                Age, 
+                CigaretteUse=Smoking, 
+                ChewingTobaccoUse=`Chewing tobacco`,  
+                AlcoholUse=`Alcohol Drink`, 
+                KhatUse=`Khat use`, 
+                CoffeeUse=`Coffee drinking`, 
+                Mycotoxin_CIT=CIT,
+                Mycotoxin_DON=DON,
+                Mycotoxin_OTA=OTA,
+                Mycotoxin_TA=TA
+  ) %>%
+  left_join(
+    read_excel("inputs/mycotoxins.xlsx") %>%
+    column_to_rownames("SampleID") %>%
+    apply(., 1, function(x) sum(x>0)) %>%
+    data.frame(Mycotoxin_TotalDetected=.) %>%
+    rownames_to_column("SampleID")
+  ) %>%
+    left_join(
+    read_excel("inputs/mycotoxins.xlsx") %>%
+    column_to_rownames("SampleID") %>%
+    apply(., 1, function(x) sum(x)) %>%
+    data.frame(Mycotoxin_TotalConcentration=.) %>%
+    rownames_to_column("SampleID")
+  )
+
+interactive_table(covariates)
+
+nonzero<-function(x){sum(x>0)}
+
+covariates %>%
+  pivot_longer(contains("Mycotoxin"), names_to = "Metric", values_to="conc_ugL") %>%
+  group_by(Group, Metric) %>%
+  dplyr::select(-Age) %>%
+  summarize_if(is.numeric, lst(mean,sd,median,min,max, length, nonzero)) %>%
+  arrange(Metric) %>%
+  mutate(Mean_SD=paste0(mean, " ± ", sd),
+         median_range=paste0(median, " [",min," - ",max, "]")) %>%
+  dplyr::select(Group, Metric, Mean_SD, median_range, nonzero) %>%
+  interactive_table()
+
+covariates %>%
+  pivot_longer(contains("Mycotoxin"), names_to = "Metric", values_to="conc_ugL") %>%
+  group_by(Metric) %>%
+  do(
+    wilcox.test(conc_ugL~Group, data=.) %>%
+      broom::tidy()
+  ) %>%
+  interactive_table()
+
+
+covariates %>%
+  pivot_longer(contains("Mycotoxin"), names_to = "Metric", values_to="conc_ugL") %>%
+  group_by(Group, Metric) %>%
+  dplyr::select(-Age) %>%
+  summarize_if(is.numeric, lst(mean,sd,median,min,max, length, detected=nonzero)) %>%
+  ungroup() %>%
+  mutate(notdetected=length-detected) %>%
+  dplyr::select(Group, Metric, detected, notdetected) %>%
+  group_by(Metric) %>%
+  summarize(Fisher_Pvalue=fisher.test(matrix(c(detected, notdetected), nrow =2))$p)
+```
+
+Dropping CIT as co-variate for healthy cohort as not found in healthy group. Also, dropping total mycotoxin going forward as it is highly co-linear with the levels of TA.
+
+## Figure 3A. Alpha Diversity
+
+Finding a model that minimizes the AIC of the model.
+
+```{r}
+alpha_cov<-
+fig1_adiversity %>%
+  dplyr::select(SampleID, PhylogeneticDiversity, ASV_Richness, ShannonDiversity) %>%
+  left_join(covariates) %>%
+  filter(Group=="Healthy")
+
+fit<-glm(ShannonDiversity~Sex + Age + AlcoholUse + KhatUse + CoffeeUse + Mycotoxin_DON + Mycotoxin_OTA + Mycotoxin_TA + Mycotoxin_TotalDetected, data=alpha_cov)
+summary(fit) # 161.05
+
+#khat use only 4 individuals,  remove
+fit<-glm(ShannonDiversity~Sex + Age + AlcoholUse + CoffeeUse + Mycotoxin_DON + Mycotoxin_OTA + Mycotoxin_TA + Mycotoxin_TotalDetected, data=alpha_cov)
+summary(fit) # 159.74
+
+#similarly, only 9 people don't consume coffee
+fit<-glm(ShannonDiversity~Sex + Age + AlcoholUse + Mycotoxin_DON + Mycotoxin_OTA + Mycotoxin_TA + Mycotoxin_TotalDetected, data=alpha_cov)
+summary(fit) # 159.04
+
+#Mycotoxin_TotalDetected is an integer which might cause some issues, will remove
+fit<-glm(ShannonDiversity~Sex + Age + AlcoholUse + Mycotoxin_DON + Mycotoxin_OTA + Mycotoxin_TA, data=alpha_cov)
+summary(fit) # 158.58
+
+#Minimize to just obvious variables with larger coefficients
+fit<-glm(ShannonDiversity~Sex + Age + AlcoholUse, data=alpha_cov)
+summary(fit)  # 155.62
+
+fit<-glm(ShannonDiversity~Sex + AlcoholUse, data=alpha_cov)
+summary(fit) # 153.84
+```
+
+Below, will show all tested coefficients, but will only report sex and alcohol use as significant based on final model.
+
+```{r}
+fit<-glm(ShannonDiversity~Sex + Age + AlcoholUse + KhatUse + CoffeeUse + Mycotoxin_DON + Mycotoxin_OTA + Mycotoxin_TA + Mycotoxin_TotalDetected, data=alpha_cov)
+summary(fit)
+
+summary(fit)$coefficients %>%
+  as.data.frame() %>%
+  rownames_to_column("Covariate") %>%
+  filter(Covariate!="(Intercept)") %>%
+  arrange(Estimate) %>%
+  mutate(Covariate=factor(Covariate, levels=Covariate)) %>%
+  ggplot(aes(x=Covariate, y=Estimate, ymin=Estimate-`Std. Error`, ymax=Estimate+`Std. Error`, label=paste("P=", round(`Pr(>|t|)`,2)))) +
+  geom_hline(yintercept = 0, linetype="dashed", color="grey50") +
+  geom_point() +
+  geom_errorbar(width=0) +
+  geom_text(size=2) +
+  coord_flip() +
+  ylab("Effect on Shannon's Diversity (Estimate ± SE)")
+
+ggsave("manuscript_figures/covariates_healthy.pdf", height=2, width=2.5, useDingbats=F)
+```
+
+## Figure 3B. Boxplot of Acohol and Sex as covariates.
+
+```{r}
+alpha_cov %>% 
+  ggplot(aes(x=Sex, y=ShannonDiversity, fill=AlcoholUse)) +
+  #geom_boxplot(outlier.alpha=0,) +
+  stat_summary(geom="bar", position=position_dodge(), color="black") +
+  geom_point(position=position_jitterdodge(jitter.width=0.2, jitter.height=0), shape=21) +
+  coord_cartesian(ylim=c(2, 6)) +
+  scale_fill_manual(values=c("grey50","indianred"))
+ggsave("manuscript_figures/sex_alcohol.pdf", height=2, width=2.5, useDingbats=F)
+
+fit<-alpha_cov %>% aov(ShannonDiversity~AlcoholUse*Sex, data=.)
+summary(fit)
+```
+
+
+## Figure 3C. ADONIS
+
+```{r}
+vegan::adonis2(dists$`CLR Euclidean`~Sex + Age +  AlcoholUse + KhatUse + CoffeeUse + Mycotoxin_DON + Mycotoxin_OTA + Mycotoxin_TA + Mycotoxin_TotalDetected,
+               data=covariates[match(labels(dists$`CLR Euclidean`), covariates$SampleID),],by="terms", permutations=9999, parallel=10) %>% print()
+```
+
+
+## Figure 3D. Sex by PC2
+
+```{r}
+pcos$`CLR Euclidean`$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(metadata) %>%
+    left_join(clustered_metadata) %>%
+    ggplot(aes(x=Sex, y=Axis.2, fill=Sex)) +
+    geom_boxplot() +
+    #stat_summary(geom="bar", position=position_dodge(), color="black") +
+    geom_point(position=position_jitterdodge(jitter.width=0.2, jitter.height=0), shape=21) +
+    ylab(paste0("PC2: ",round(pcos$`CLR Euclidean`$values$Relative_eig[2]*100,2),"%")) +
+  coord_cartesian(ylim=c(-20, 35)) +
+  scale_fill_manual(values=c("grey50","dodgerblue"))
+ggsave("manuscript_figures/sex.pdf", heigh=2, width=2, useDingbats=F)
+
+pcos$`CLR Euclidean`$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(metadata) %>%
+    left_join(clustered_metadata) %>%
+  t.test(Axis.2~Sex, data=.)
+```
+
+
+***
+
+# Figure 4. Cross-sectional analysis by cancer status
+
+## Figure 4ABC. Alpha Diversity
+
+```{r}
+adiversity<-
+  asv_table %>% subsample_table() %>% t() %>% picante::pd(., asv_tree) %>%
+  rownames_to_column("SampleID") %>%
+  dplyr::select(SampleID, PhylogeneticDiversity="PD", ASV_Richness="SR") %>%
+  full_join(
+    asv_table %>% subsample_table() %>% t() %>% diversity(., "shannon") %>% data.frame(ShannonDiversity=.) %>% rownames_to_column("SampleID")
+  ) %>%
+  left_join(metadata)
+
+interactive_table(adiversity)
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric, Group) %>%
+  summarize_at("Diversity", lst(mean,median,sd,min,max)) %>%
+  interactive_table()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  ggplot(aes(x=Group, y=Diversity, fill=Group)) +
+  geom_boxplot() +
+  facet_wrap(~Metric, scales="free") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  theme(legend.position="none") +
+  xlab("") +
+  ylab("") +
+  scale_fill_manual(values=c("cornflowerblue","indianred"))
+
+ggsave("manuscript_figures/cross_section_alpha_diversity.pdf", height=2, width=3, useDingbats=F)
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  do(
+    t.test(Diversity~Group, data=.) %>%
+      broom::tidy()
+  ) %>%
+  knitr::kable()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  do(
+    wilcox.test(Diversity~Group, data=.) %>%
+      broom::tidy()
+  ) %>%
+  knitr::kable()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  do(
+    glm(Diversity~Group + Age + Sex + `Alcohol Drink`, data=.) %>%
+      broom::tidy()
+  ) %>%
+  knitr::kable()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  filter(Metric=="ASV_Richness") %>%
+  do(
+    glm.nb(Diversity~Group + Age + Sex + `Alcohol Drink`, data=.) %>%
+      broom::tidy()
+  )  %>%
+  knitr::kable()
+```
+
+## Figure 4D. Beta Diversity
+
+```{r}
+genus_sum<-summarize_taxa(asv_table, asv_taxonomy %>% column_to_rownames("ASV"))$Genus
+
+dists<-list()
+  dists$`CLR Euclidean`<-genus_sum %>% make_clr() %>% t() %>% dist(., method="euclidean")
+
+pcos<-lapply(dists, ape::pcoa)
+
+lapply(names(pcos), function(x){
+    pcos[[x]]$values %>%
+      as.data.frame() %>%
+      mutate(Metric=x) %>%
+      mutate(Axis=1:nrow(.))
+  }) %>%
+  bind_rows() %>%
+  filter(Axis %in% 1:3) %>%
+  dplyr::select(Metric, Axis, everything()) %>%
+  interactive_table()
+
+  pcos$`CLR Euclidean`$vectors %>%
+    as.data.frame() %>%
+    rownames_to_column("SampleID") %>%
+      left_join(metadata) %>%
+    ggplot(aes(x=Axis.1, y=Axis.2, fill=Group)) +
+    geom_point(shape=21, color="black") +
+    theme(legend.position="bottom") +
+    xlab(paste0("PC1: ",round(pcos$`CLR Euclidean`$values$Relative_eig[1]*100,2),"%")) +
+    ylab(paste0("PC2: ",round(pcos$`CLR Euclidean`$values$Relative_eig[2]*100,2),"%")) +
+    scale_fill_manual(values=c("cornflowerblue","indianred"))
+  ggsave("manuscript_figures/cancer_pcoa_aitchison.pdf", height=2.2, width=2)
+
+
+vegan::adonis2(dists$`CLR Euclidean`~Group + Age + Sex + `Alcohol Drink`, data=metadata[match(labels(dists$`CLR Euclidean`), metadata$SampleID),], by="terms") %>% print()
+```
+
+## Figure 4E. Clusters 
+
+```{r}
+Metric="CLR Euclidean"
+gapstats<-clusGap(pcos[[Metric]]$vectors, FUN=do_pam, K.max = 10, B=100)
+
+gapstats<-
+  gapstats$Tab %>%
+  as.data.frame() %>%
+  mutate(Nclusters=1:nrow(.)) %>%
+  dplyr::select(Nclusters, GapStatistic=gap, SE=SE.sim)
+
+ggplot(gapstats, aes(x=Nclusters, y=GapStatistic, ymin=GapStatistic-SE, ymax=GapStatistic+SE)) +
+  geom_errorbar(width=0) +
+  geom_point() +
+  scale_x_continuous(breaks=(1:10))
+
+clusters<-pam(dists[[Metric]], k=2, diss=TRUE, cluster.only = TRUE)
+clustered_metadata_all<-tibble(SampleID=names(clusters), Cluster_all=paste0("Cluster_", clusters))
+
+clustered_metadata %>% left_join(clustered_metadata_all) %>% interactive_table() #they are flipped relative to previous assignments to 1 vs 2, will re-arranged.
+clustered_metadata_all<-clustered_metadata_all %>% mutate(Cluster=if_else(Cluster_all=="Cluster_1", "Cluster_2","Cluster_1"))
+
+metadata %>% left_join(clustered_metadata_all) %>%
+  ggplot(aes(x=Group, fill=Cluster)) +
+  geom_bar(color="black") +
+  scale_fill_manual(values=c("darkorange","purple4")) +
+  ylab("# Participants")
+  ggsave("manuscript_figures/cancer_clusters.pdf", height=2, width=2)
+
+  
+  metadata %>% left_join(clustered_metadata_all) %>%
+    group_by(Group, Cluster) %>%
+    summarize(N=n()) %>%
+    pivot_wider(names_from = "Cluster", values_from = "N") %>%
+    knitr::kable()
+  
+
+  metadata %>% left_join(clustered_metadata_all) %>%
+    group_by(Group, Cluster) %>%
+    summarize(N=n()) %>%
+    pivot_wider(names_from = "Cluster", values_from = "N") %>%
+    dplyr::select(1,3,2) %>%
+    as.data.frame() %>%
+    column_to_rownames("Group") %>%
+    .[c(2,1),] %>% #flip order to change how OR is described
+    fisher.test()
+```
+
+Now will confirm with multivariable logistic regression
+
+```{r}
+fit<-
+metadata %>% left_join(clustered_metadata_all) %>%
+  mutate(DiseaseBin=if_else(Group=="Diseased", 1, 0)) %>%
+  glm(DiseaseBin~ Cluster + Age + Sex + `Alcohol Drink`, family=binomial, data=.)
+
+summary(fit)  
+broom::tidy(fit, exponentiate = TRUE, conf.int=TRUE) %>% knitr::kable()
+```
+
+***
+
+# Figure S3. Cross-section by ESCC vs EAC
+
+## Figure S3ABC. Alpha Diversity
+
+```{r}
+cancer_asvs<-asv_table[,subset(metadata, Group=="Diseased")$SampleID] %>% filter_features(1,1)
+
+adiversity<-
+  cancer_asvs %>% subsample_table() %>% t() %>% picante::pd(., asv_tree) %>%
+  rownames_to_column("SampleID") %>%
+  dplyr::select(SampleID, PhylogeneticDiversity="PD", ASV_Richness="SR") %>%
+  full_join(
+    cancer_asvs %>% subsample_table() %>% t() %>% diversity(., "shannon") %>% data.frame(ShannonDiversity=.) %>% rownames_to_column("SampleID")
+  ) %>%
+  left_join(metadata)
+
+interactive_table(adiversity)
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric, Histology) %>%
+  summarize_at("Diversity", lst(mean,median,sd,min,max)) %>%
+  interactive_table()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  ggplot(aes(x=Histology, y=Diversity, fill=Histology)) +
+  geom_boxplot() +
+  facet_wrap(~Metric, scales="free") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  theme(legend.position="none") +
+  xlab("") +
+  ylab("")
+
+ggsave("manuscript_figures/histology_alpha_diversity.pdf", height=2, width=3, useDingbats=F)
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  do(
+    t.test(Diversity~Histology, data=.) %>%
+      broom::tidy()
+  ) %>%
+  knitr::kable()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  do(
+    wilcox.test(Diversity~Histology, data=.) %>%
+      broom::tidy()
+  ) %>%
+  knitr::kable()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  group_by(Metric) %>%
+  do(
+    glm(Diversity~Histology + Age + Sex + `Alcohol Drink`, data=.) %>%
+      broom::tidy()
+  )  %>%
+  knitr::kable()
+
+adiversity %>%
+  pivot_longer(c("PhylogeneticDiversity","ASV_Richness","ShannonDiversity"), names_to = "Metric", values_to = "Diversity") %>%
+  filter(Metric=="ASV_Richness") %>%
+  do(
+    glm.nb(Diversity~Histology + Age + Sex + `Alcohol Drink`, data=.) %>%
+      broom::tidy()
+  )  %>%
+  knitr::kable()
+```
+
+# Figure S3D. Beta Diversity
+
+```{r}
+genus_sum<-summarize_taxa(cancer_asvs, asv_taxonomy %>% column_to_rownames("ASV"))$Genus
+
+dists<-list()
+  dists$`CLR Euclidean`<-genus_sum %>% make_clr() %>% t() %>% dist(., method="euclidean")
+
+  pcos<-lapply(dists, ape::pcoa)
+
+  pcos$`CLR Euclidean`$vectors %>%
+    as.data.frame() %>%
+    rownames_to_column("SampleID") %>%
+      left_join(metadata) %>%
+    ggplot(aes(x=Axis.1, y=Axis.2, fill=Histology)) +
+    geom_point(shape=21, color="black") +
+    theme(legend.position="bottom") +
+    xlab(paste0("PC1: ",round(pcos$`CLR Euclidean`$values$Relative_eig[1]*100,2),"%")) +
+    ylab(paste0("PC2: ",round(pcos$`CLR Euclidean`$values$Relative_eig[2]*100,2),"%"))
+  ggsave("manuscript_figures/histology_pcoa_aitchison.pdf", height=2.2, width=2)
+
+
+vegan::adonis2(dists$`CLR Euclidean`~Histology + Age + Sex + `Alcohol Drink`, data=metadata[match(labels(dists$`CLR Euclidean`), metadata$SampleID),])
+```
+
+***
+
+# Figure 5. Biomarkers between Cases and Controls
+
+## Table S3. Differential species
+
+```{r}
+genus_sums<-summarize_taxa(asv_table, asv_taxonomy %>% column_to_rownames("ASV"))$Species # disregard variable name of genus, species abundances were carried forward for greater specificity
+genus_sums<-genus_sums[,metadata$SampleID] %>% filter_features(20,20) # must be in at least 20 samples
+
+clr<-aldex.clr(genus_sums, model.matrix(~Group + Sex + Age + `Alcohol Drink`, metadata), mc.samples = 128, denom = "all")
+
+aldex_results<-aldex.glm(clr, fdr.method="BH")
+
+aldex_results %>%
+  rownames_to_column("Taxon") %>%
+  dplyr::select(Taxon, Group_Estimate=`GroupDiseased:Est`, Group_Pvalue=`GroupDiseased:pval`, Group_FDR=`GroupDiseased:pval.padj`) %>%
+  filter(Group_FDR<0.1) %>%
+  arrange(desc(Group_Estimate)) %>%
+  interactive_table()
+```
+
+## Figure 5A. Cladogram of significantly different genera
+
+```{r}
+treedat<-
+aldex_results %>%
+  rownames_to_column("Taxon") %>%
+  dplyr::select(Taxon, Group_Estimate=`GroupDiseased:Est`, Group_SE=`GroupDiseased:SE`, Group_Pvalue=`GroupDiseased:pval`, Group_FDR=`GroupDiseased:pval.padj`) %>%
+  filter(Group_FDR<0.1) %>%
+  mutate(Taxon=paste0("root; ", Taxon)) %>%
+  separate(Taxon, c("Root","Kingdom","Phylum","Class","Order","Family","Genus","Species"), sep="; ", remove = F) %>%
+  mutate(Species=paste0("S",1:nrow(.),":",Genus," ", Species)) %>%
+  mutate_if(is.character, function(x) if_else(x=="NA", "Not Assigned", x)) %>% #replace empty character columns with Not assigned
+  mutate(pathString=paste(Root, Kingdom, Phylum, Class, Order, Family, Genus, Species, sep="/")) %>% #create a new column pathString by concatenating values from Kingdom, Phylum, Class, Order, Family, and Genus columns, separated by "/".
+  arrange(pathString)
+
+clado <-
+treedat %>%
+  dplyr::select(pathString, Taxon) %>%
+  data.tree::as.Node() %>%
+  data.tree::as.phylo.Node()
+  
+
+plottree<-ggtree( clado, layout="circular") %<+% (treedat %>% mutate(Snum=gsub(":..+","", Species)) %>% dplyr::select(Snum, everything())) +
+  geom_tippoint(aes(fill=Group_Estimate, size=-log10(Group_FDR)), shape=21) +
+  geom_tiplab(aes(label=gsub("NA", "sp.", Species) %>% gsub("S[0-9]+:","",.)), size=2, offset=0.7) +
+  scale_fill_gradient2(low="cornflowerblue",high="darkred") +
+  theme(legend.position="bottom") 
+  
+
+interest<-c("Clostridia","Veillonellales-Selenomonadales","Lactobacillales","Actinobacteriota","Bacteroidota","Gammaproteobacteria")
+for( i in interest){
+  message(i)
+  tips<-treedat %>% filter(grepl(i, pathString)) %>% pull(Species) %>% gsub(":..+","", .)
+  nd<-getMRCA(phy=clado, tip=as.character(tips))
+  plottree<- 
+    plottree + 
+    #geom_hilight(
+    #node=nd,
+    #fill="grey50",
+    #alpha=0.2
+    #) +
+    geom_cladelabel(node=nd, label=i, offset = 10)
+}
+
+plottree
+
+ggsave("manuscript_figures/cancer_cladogram.pdf", height=6, width=6, useDingbats=F)
+```
+
+## Table S4. PICRUST Case vs Control
+
+```{r}
+picrust<-read_tsv("picrust2_out_strat/pathways_w_desc.tsv")
+picrust<-picrust[,c("pathway","description", colnames(asv_table))]
+
+picrust_results<-
+picrust %>%
+  pivot_longer(!c(pathway, description), names_to = "SampleID", values_to = "Abundance") %>%
+  group_by(SampleID) %>%  
+  mutate(Abundance=(Abundance/sum(Abundance)))  %>% # convert to proportion... shouldn't be necessary as already subsampled.
+  group_by(pathway) %>%
+  mutate(Abundance=log2(Abundance+(min_nonzero(Abundance)*(2/3)))) %>%
+  ungroup() %>%
+  left_join(metadata) %>%
+  group_by(pathway, description) %>%
+  do(
+    glm(Abundance~Group + Sex + Age + `Alcohol Drink`, data=.) %>%
+      broom::tidy()
+  ) %>%
+  group_by(term) %>%
+  mutate(FDR=p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+picrust_results %>%
+  filter(term!="(Intercept)" & FDR<0.1) %>%
+  interactive_table() # no significant confounders
+```
+
+Will now extract the taxa driving these changes. Will only extract the most abundant taxa driving 
+
+```{r}
+sigpath<-
+picrust_results %>%
+  filter(term=="GroupDiseased" & FDR<0.1) %>%
+  pull(pathway)
+
+pathstrat<-read_tsv("picrust2_out_strat/pathways_out/path_abun_contrib.tsv.gz") %>% dplyr::rename(Pathway=`function`) %>% filter(Pathway %in% sigpath)
+
+contribs<-
+pathstrat %>% 
+  dplyr::rename(ASV=taxon) %>% 
+  left_join(asv_taxonomy) %>%
+  group_by(Genus, Pathway) %>%
+  summarize(mean=mean(taxon_rel_function_abun)) %>%
+  group_by(Pathway) %>%
+  top_n(5, mean) %>%
+  arrange(desc(mean)) %>%
+  summarize(Genera=paste(Genus, collapse = ", "))
+
+picrust_results %>%
+  filter(term!="(Intercept)" & FDR<0.1) %>%
+  left_join(contribs %>% dplyr::rename(pathway=Pathway)) %>%
+  interactive_table() # no significant confounders
+```
+
+
+
+## Figure 5B. Picrust vs canacer
+
+```{r}
+lineage<-read_tsv("/data/shared_resources/databases/metacyc/25.1/map_metacyc-pwy_lineage.tsv", col_names=c("ID","Lineage")) #dug up from https://forum.biobakery.org/t/metacyc-hierarchy-to-invetigate-identify-specific-pathways/1830/4
+
+plot_results<-picrust_results %>%filter(term=="GroupDiseased" & FDR<0.1)
+
+#gplots::venn(list(meta=lineage$ID, pathways=plot_results$pathway))
+#gplots::venn(list(meta=lineage$ID, pathways=plot_results$pathway), show.plot = F) %>% print() #3 pathways missing from annotation
+
+#attr(,"intersections")$pathways
+#[1] "GLYCOLYSIS-TCA-GLYOX-BYPASS" "GLYOXYLATE-BYPASS"           "TCA-GLYOX-BYPASS"       
+#These are superpathways being excluded
+
+lineage<-lineage %>% filter(ID %in% plot_results$pathway & Lineage!="Super-Pathways")
+lineage<-lineage %>% mutate(Lineage=paste0("Origin|", Lineage,"|", ID))
+
+tree<-
+lineage %>%
+  filter(!duplicated(ID)) %>% # remove duplicates
+  data.tree::FromDataFrameTable(., pathName="Lineage", pathDelimiter = "|")
+tree<-igraph::as.igraph(tree)       
+lout<-ggraph::create_layout(tree, layout="igraph", circular=TRUE, algorithm="tree")
+
+lout<-lout %>% left_join(plot_results %>% dplyr::rename(name=pathway) %>% mutate(Annotation=paste(name, description, sep=": ")))
+
+lout$Annotation=if_else(is.na(lout$Annotation), lout$name, lout$Annotation)
+lout$Annotation<-gsub("−","-", lout$Annotation)
+
+ggraph::ggraph(lout) +
+  ggraph::geom_edge_diagonal() +
+  ggraph::geom_node_point(aes(fill=estimate, size=-log10(p.value)), shape=21) +
+  ggraph::geom_node_text(aes(label=Annotation), size=2) +
+  scale_fill_gradient2(low="darkblue",high="darkred") +
+  theme_void() +
+  theme(legend.position="bottom")
+ggsave("manuscript_figures/case_v_control.pdf", height=12, width=24, useDingbats=F)         
+
+```
+
+***
+
+# Figure S4. Comparison of Esophageal cancer cohorts 
+
+## Data Processing
+
+Validation cohorts:
+V3-V4: Chen PRJNA961904 https://bmcmicrobiol.biomedcentral.com/articles/10.1186/s12866-024-03233-4 31 patients and 21 healthy controls, China. (early-stage intramucosal esophageal squamous carcinoma). 52 are saliva.
+  Sample names and numbers reveal metadata. 31 SAL must be saliva cancer, and the 21 SALNC must be no cancer.
+V3-V4: Jiang PRJNA853196 https://link.springer.com/article/10.1007/s00432-022-04393-4 oral swabs, control = 53, ESCC = 56. metadata available
+
+Given issues with denoising NovaSeq data and the larger amplicon V3-V4 having problematic features for overlap, especially from Novaseq, will carry forward reverse read only.
+
+
+```{bash, eval=F}
+mkdir external
+mkdir external/PRJNA961904
+mkdir external/PRJNA853196
+
+export PATH=$PATH:/data/shared_resources/sftwr/sratoolkit.3.0.0-ubuntu64/bin
+#vdb-config -i # caching to ~/.prefetch_cache/
+
+while read line; do
+  SRR=$(echo $line | cut -d "," -f 1)
+  PRJ=$(echo $line | cut -d "," -f 5)
+  SAMN=$(echo $line | cut -d "," -f 6)
+  echo $(date): $SRR from $SAMN from $PRJ
+  
+  mkdir -p external/$PRJ/$SAMN
+  fasterq-dump --outdir external/$PRJ/$SAMN --threads 6 --mem 32G $SRR
+  if [ -f "external/$PRJ/$SAMN/${SRR}_1.fastq" ]; then echo "...Success"; else echo "...FAILURE"; fi
+done < external/PRJNA961904_SraRunTable_filt.csv
+
+while read line; do
+  SRR=$(echo $line | cut -d "," -f 1)
+  PRJ=$(echo $line | cut -d "," -f 5)
+  SAMN=$(echo $line | cut -d "," -f 6)
+  echo $(date): $SRR from $SAMN from $PRJ
+  
+  mkdir -p external/$PRJ/$SAMN
+  fasterq-dump --outdir external/$PRJ/$SAMN --threads 6 --mem 32G $SRR
+  if [ -f "external/$PRJ/$SAMN/${SRR}_1.fastq" ]; then echo "...Success"; else echo "...FAILURE"; fi
+done < external/PRJNA853196_SraRunTable_filt.csv
+
+
+```
+
+### Process PRJNA853196
+
+```
+PCR amplification
+16S rDNA genes of V3–V4 region were amplified using universal primers, 
+namely 338F (5′-ACTCCTACGGGAGGCAGCAG-3′) and 806R (5′ -GGACTACHVGGGTWTCTAAT-3′). 
+All PCR reactions (including denaturation, annealing, and elongation) were carried out with 
+Phusion® High-Fidelity PCR Master Mix (New England Biolabs). 
+After electrophoresis of PCR products, samples with bright main strip between 
+400 and 450 bp were chosen for the next mixing and purification with 
+Qiagen Gel Extraction Kit (Qiagen, Germany).
+
+Sequencing processing and analysis
+Purified amplicons were pooled in equimolar and paired-end sequenced on an Illumina Novaseq6000 PE250 
+platform (Illumina, San Diego, USA). The raw data were filtered with QIIME (v 1.8.0), discarding the 
+reads which were de-replicated or shorter than 150 bp. Filtered reads were clustered into OTUs with the
+assumed 97% similarity. Compared with the SILVA database (version 128), the species classification 
+information of each OTU was obtained. All raw reads were stored in NCBI Sequence Read Archive (SRA) database, 
+and the accession number is PRJNA853196.
+```
+
+```{r, eval=F}
+library(tidyverse)
+library(dada2)
+library(Biostrings)
+dir.create("external/PRJNA853196/filtered")
+prj_meta<-
+  read_csv("external/PRJNA853196_SraRunTable_filt.csv") %>% dplyr::select(SampleID=BioSample, BioProject, Run, Group) %>%
+  mutate(R1=paste0("external/PRJNA853196/", SampleID,"/", Run,"_1.fastq")) %>%
+  mutate(R2=paste0("external/PRJNA853196/", SampleID,"/", Run,"_2.fastq")) %>%
+  mutate(R1_filt=gsub("SAMN[0-9]+", "filtered", R1)) %>%
+  mutate(R2_filt=gsub("SAMN[0-9]+", "filtered", R2))
+
+for(i in prj_meta$R1){message(file.exists(i))}
+for(i in prj_meta$R2){message(file.exists(i))}
+
+plotQualityProfile(prj_meta$R1[1:3])
+plotQualityProfile(prj_meta$R2[1:3])
+
+Biostrings::readDNAStringSet(prj_meta$R1[1], format="fastq") # 220 x 220, primers appear to have been removed
+Biostrings::readDNAStringSet(prj_meta$R2[1], format="fastq")
+
+
+dmp<-
+  filterAndTrim(
+    fwd=prj_meta$R1,
+    filt=prj_meta$R1_filt,
+    rev=prj_meta$R2,
+    filt.rev=prj_meta$R2_filt,
+    compress=FALSE,
+    trimLeft = c(0,0), # primer lengths as the primer seqs are still intact in read
+    truncLen = c(200,200),
+    multithread = 16,
+    rm.phix=TRUE
+  )
+
+errF <- learnErrors(prj_meta$R1_filt, multithread=16)
+errR <- learnErrors(prj_meta$R2_filt, multithread=16)
+dadaFs <- dada(prj_meta$R1_filt, err=errF, multithread=16)
+dadaRs <- dada(prj_meta$R2_filt, err=errR, multithread=16)
+mergers <- mergePairs(dadaFs, prj_meta$R1_filt, dadaRs, prj_meta$R2_filt, verbose=TRUE)
+#seqtab <- makeSequenceTable(mergers)
+#dim(seqtab)
+#sum(seqtab)
+seqtab <- makeSequenceTable(dadaRs)
+dim(seqtab)
+sum(seqtab)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=16, verbose=TRUE)
+sum(seqtab.nochim)/sum(seqtab)
+
+asv_table<-t(seqtab.nochim) %>% qiime2R::filter_features(2,2)
+asv_taxonomy<-tibble(ASV=paste0("ASV_", 1:nrow(asv_table)), Sequence=rownames(asv_table))
+asv_taxonomy$Sequence<-asv_taxonomy$Sequence %>% DNAStringSet() %>% reverseComplement() %>% as.character()
+
+taxonomy <- assignTaxonomy(asv_taxonomy$Sequence, "/data/shared_resources/databases/Q2_2023.5_db/silva_nr99_v138.1_wSpecies_train_set.fa.gz", multithread=24)
+taxonomy <- addSpecies(taxonomy, "/data/shared_resources/databases/Q2_2023.5_db/silva_species_assignment_v138.1.fa.gz", allowMultiple=TRUE)
+  
+asv_taxonomy<-asv_taxonomy %>% left_join(taxonomy %>% as.data.frame() %>% dplyr::rename(Species_Ambiguous=8) %>% rownames_to_column("Sequence"))
+
+rownames(asv_table)<-asv_taxonomy$ASV
+colnames(asv_table)<-gsub("_[12]\\.fastq","", colnames(asv_table))
+
+
+
+write_tsv(as.data.frame(asv_table) %>% rownames_to_column("ASV"), "external/PRJNA853196/PRJNA853196_asvtable.tsv")
+write_tsv(asv_taxonomy, "external/PRJNA853196/PRJNA853196_asvtaxonomy.tsv")
+
+```
+
+
+### Process PRJNA961904
+
+```
+Microbial genomic DNA was extracted using the CTAB Method and stored at -20 °C. 
+The V3-V4 hypervariable regions, approximately 468 bp in length, were amplified by polymerase chain reaction 
+(Primers: 338 F (5′-ACTCCTACGGGAGGCAGCA-3′) and 806R (5′-GGACTACHVGGGTWTCTAAT-3′). 
+PCR samples were quantified using the Quant-it PicoGreen dsDNA Assay Kit on a Microplate reader (BioTek, FLx800) and 
+mixed based on the amount of data for each sample. DNA library construction was performed using the TruSeq Nano DNA LT 
+Library Prep Kit (Illumina Scientific Co., Ltd). The quantity and quality of each library were measured using the Quant-iT 
+PicoGreen dsDNA Assay Kit and Agilent High Sensitivity DNA Kit, respectively. For qualified libraries, the NovaSeq 6000 SP Reagent Kit (500 cycles)
+on the Illumina NovaSeq machine was used for 2 × 250 bp double-ended sequencing.
+Raw data from the 16s rRNA sequence was processed by Personalbio Technology Co., Ltd. (Shanghai, China). 
+Amplicon sequence variants (ASVs) were integrated into merged taxonomic abundance and taxonomy classification tables. 
+All amplicon raw data have been submitted to the Sequence Read Archive (SRA) in NCBI (Archive number: PRJNA961904).
+
+```
+
+```{r, eval=F}
+library(tidyverse)
+library(dada2)
+library(Biostrings)
+dir.create("external/PRJNA961904/filtered")
+prj_meta<-
+  read_csv("external/PRJNA961904_SraRunTable_filt.csv") %>% dplyr::select(SampleID=BioSample, BioProject, Run, Group) %>%
+  mutate(R1=paste0("external/PRJNA961904/", SampleID,"/", Run,"_1.fastq")) %>%
+  mutate(R2=paste0("external/PRJNA961904/", SampleID,"/", Run,"_2.fastq")) %>%
+  mutate(R1_filt=gsub("SAMN[0-9]+", "filtered", R1)) %>%
+  mutate(R2_filt=gsub("SAMN[0-9]+", "filtered", R2))
+
+for(i in prj_meta$R1){message(file.exists(i))}
+for(i in prj_meta$R2){message(file.exists(i))}
+
+plotQualityProfile(prj_meta$R1[1:3])
+plotQualityProfile(prj_meta$R2[1:3])
+
+Biostrings::readDNAStringSet(prj_meta$R1[1], format="fastq") # primers present and 251 x 243
+Biostrings::readDNAStringSet(prj_meta$R2[1], format="fastq")
+
+
+dmp<-
+  filterAndTrim(
+    fwd=prj_meta$R1,
+    filt=prj_meta$R1_filt,
+    rev=prj_meta$R2,
+    filt.rev=prj_meta$R2_filt,
+    compress=FALSE,
+    trimLeft = c(19,20), # primer lengths as the primer seqs are still intact in read
+    truncLen = c(210,200),
+    multithread = 16,
+    rm.phix=TRUE
+  )
+
+errF <- learnErrors(prj_meta$R1_filt, multithread=16)
+errR <- learnErrors(prj_meta$R2_filt, multithread=16)
+dadaFs <- dada(prj_meta$R1_filt, err=errF, multithread=16)
+dadaRs <- dada(prj_meta$R2_filt, err=errR, multithread=16)
+mergers <- mergePairs(dadaFs, prj_meta$R1_filt, dadaRs, prj_meta$R2_filt, verbose=TRUE)
+#seqtab <- makeSequenceTable(mergers)
+#dim(seqtab)
+#sum(seqtab)
+seqtab <- makeSequenceTable(dadaRs)
+dim(seqtab)
+sum(seqtab)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=16, verbose=TRUE)
+sum(seqtab.nochim)/sum(seqtab)
+
+asv_table<-t(seqtab.nochim) %>% qiime2R::filter_features(2,2)
+asv_taxonomy<-tibble(ASV=paste0("ASV_", 1:nrow(asv_table)), Sequence=rownames(asv_table))
+asv_taxonomy$Sequence<-asv_taxonomy$Sequence %>% DNAStringSet() %>% reverseComplement() %>% as.character()
+
+taxonomy <- assignTaxonomy(asv_taxonomy$Sequence, "/data/shared_resources/databases/Q2_2023.5_db/silva_nr99_v138.1_wSpecies_train_set.fa.gz", multithread=24)
+taxonomy <- addSpecies(taxonomy, "/data/shared_resources/databases/Q2_2023.5_db/silva_species_assignment_v138.1.fa.gz", allowMultiple=TRUE)
+  
+asv_taxonomy<-asv_taxonomy %>% left_join(taxonomy %>% as.data.frame() %>% dplyr::rename(Species_Ambiguous=8) %>% rownames_to_column("Sequence"))
+
+rownames(asv_table)<-asv_taxonomy$ASV
+colnames(asv_table)<-gsub("_[12]\\.fastq","", colnames(asv_table))
+
+
+
+write_tsv(as.data.frame(asv_table) %>% rownames_to_column("ASV"), "external/PRJNA961904/PRJNA961904_asvtable.tsv")
+write_tsv(asv_taxonomy, "external/PRJNA961904/PRJNA961904_asvtaxonomy.tsv")
+
+```
+
+
+***
+
+### Figure S4B. Beta Diversity
+
+```{r}
+mulisa<-list()
+mulisa$meta<-metadata %>% dplyr::select(SampleID, Group) %>% mutate(Dataset="Mulisa") %>% mutate(Group=if_else(Group=="Diseased", "Case","Control"))
+mulisa$asv<-asv_table
+mulisa$tax<-asv_taxonomy
+mulisa$genus<-summarize_taxa(mulisa$asv, mulisa$tax %>% column_to_rownames("ASV"))$Genus
+mulisa$family<-summarize_taxa(mulisa$asv, mulisa$tax %>% column_to_rownames("ASV"))$Family
+dim(mulisa$genus)
+
+jiang<-list()
+jiang$meta<-read_csv("external/PRJNA853196_SraRunTable_filt.csv") %>% dplyr::select(SampleID=Run, Group) %>% mutate(Dataset="Jiang")
+jiang$asv<-read_tsv("external/PRJNA853196/PRJNA853196_asvtable.tsv") %>% column_to_rownames("ASV")
+jiang$tax<-read_tsv("external/PRJNA853196/PRJNA853196_asvtaxonomy.tsv")
+jiang$genus<-summarize_taxa(jiang$asv, jiang$tax %>% column_to_rownames("ASV"))$Genus
+jiang$family<-summarize_taxa(jiang$asv, jiang$tax %>% column_to_rownames("ASV"))$Family
+dim(jiang$genus)
+
+chen<-list()
+chen$meta<-read_csv("external/PRJNA961904_SraRunTable_filt.csv") %>% dplyr::select(SampleID=Run, Group) %>% mutate(Dataset="Chen")
+chen$asv<-read_tsv("external/PRJNA961904/PRJNA961904_asvtable.tsv") %>% column_to_rownames("ASV")
+chen$tax<-read_tsv("external/PRJNA961904/PRJNA961904_asvtaxonomy.tsv")
+chen$genus<-summarize_taxa(chen$asv, chen$tax %>% column_to_rownames("ASV"))$Genus
+chen$family<-summarize_taxa(chen$asv, chen$tax %>% column_to_rownames("ASV"))$Family
+dim(chen$genus)
+
+merged_meta<-bind_rows(mulisa$meta, chen$meta, jiang$meta)
+
+merged_genus<-
+bind_rows(
+mulisa$genus %>% rownames_to_column("Taxon") %>% pivot_longer(!Taxon, names_to = "SampleID", values_to = "Counts"),
+chen$genus %>% rownames_to_column("Taxon") %>% pivot_longer(!Taxon, names_to = "SampleID", values_to = "Counts"),
+jiang$genus %>% rownames_to_column("Taxon") %>% pivot_longer(!Taxon, names_to = "SampleID", values_to = "Counts")
+) %>%
+  pivot_wider(names_from = SampleID, values_from = Counts, values_fill = 0) %>%
+  column_to_rownames("Taxon")
+
+pc<-
+make_clr(merged_genus) %>%
+  t() %>%
+  dist(., method="euclidean") %>%
+  pcoa()
+
+pc$vectors %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(merged_meta) %>%
+  ggplot(aes(x=Axis.1, y=Axis.2, color=Dataset, shape=Group)) + 
+  geom_point(alpha=0.5) +
+    xlab(paste0("PC1: ",round(pc$values$Relative_eig[1]*100,2),"%")) +
+    ylab(paste0("PC2: ",round(pc$values$Relative_eig[2]*100,2),"%")) +
+  scale_shape_manual(values=c(16, 1))
+  
+ggsave("manuscript_figures/pco_cross_comparisons.pdf", height=2, width=3, useDingbats=F)
+
+merged_dist<-
+make_clr(merged_genus) %>%
+  t() %>%
+  dist(., method="euclidean")
+
+adonis2(merged_dist~Group*Dataset, data=merged_meta[match(labels(merged_dist), merged_meta$SampleID),], parallel=12)
+```
+
+### Figure S4C. Alpha Diversity
+
+```{r}
+merged_alpha<-bind_rows(
+diversity(chen$asv %>% subsample_table(), "shannon", MARGIN=2) %>% data.frame(Shannon=.) %>% rownames_to_column("SampleID"),
+diversity(jiang$asv %>% subsample_table(), "shannon", MARGIN=2) %>% data.frame(Shannon=.) %>% rownames_to_column("SampleID"), 
+diversity(mulisa$asv %>% subsample_table(), "shannon", MARGIN=2) %>% data.frame(Shannon=.) %>% rownames_to_column("SampleID") 
+) %>%
+  left_join(merged_meta)
+
+
+merged_alpha %>%
+  group_by(Dataset) %>%
+  do(
+   t.test(Shannon~Group, data=.) %>%
+     broom::tidy()
+  ) %>%
+  knitr::kable()
+
+
+merged_alpha %>%
+  mutate(Group=factor(Group, levels=c("Control","Case"))) %>%
+  ggplot(aes(x=Dataset, y=Shannon, fill=Group)) +
+  geom_boxplot() +
+  scale_fill_manual(values=c("cornflowerblue","indianred")) +
+  xlab("Cohort") +
+  ylab("Shannon's Diversity Index") +
+  theme(legend.position="none")
+ggsave("manuscript_figures/cohort_alpha.pdf", height=2, width=3)
+```
+
+### Figure S4A. Alpha Diversity
+
+```{r}
+merged_family<-
+bind_rows(
+mulisa$family %>% rownames_to_column("Taxon") %>% pivot_longer(!Taxon, names_to = "SampleID", values_to = "Counts"),
+chen$family %>% rownames_to_column("Taxon") %>% pivot_longer(!Taxon, names_to = "SampleID", values_to = "Counts"),
+jiang$family%>% rownames_to_column("Taxon") %>% pivot_longer(!Taxon, names_to = "SampleID", values_to = "Counts")
+) %>%
+  pivot_wider(names_from = SampleID, values_from = Counts, values_fill = 0) %>%
+  column_to_rownames("Taxon")
+
+
+taxa_barplot(merged_family, merged_meta, category="Dataset") +
+  theme(axis.text.x = element_blank(), axis.ticks.x=element_blank())
+ggsave("manuscript_figures/cohort_barplot.pdf", height=3, width=8, useDingbats=F)
+```
+
+***
+
+# Figure 6. Cross-cohort comparisons
+
+## Figure 6A. ROC curves
+
+```{r}
+library(randomForest)
+library(ROCR)
+library(pROC)
+
+ROCR_ROCs<-list()
+pROC_ROCs<-list()
+AUCs<-list()
+Importance<-list()
+splits<-list()
+
+merged_genus_rf<-merged_genus %>% filter_features(20,20) %>% make_proportion()
+
+for(i in 1:100){
+  message(i)
+  set.seed(as.numeric(paste0("202407",i)))
+  mulisa$meta<-mulisa$meta %>% sample_n(nrow(.)) %>% mutate(Dataset=c(rep("Training", 139), rep("Test", 72)))
+  splits[[i]]<-mulisa$meta %>% group_by(Group, Dataset) %>% count() %>% pivot_wider(names_from = Group, values_from = n) %>% mutate(Iteration=i)
+  RFmeta<-bind_rows(mulisa$meta, jiang$meta, chen$meta) %>% mutate(Group=factor(Group)) 
+  RFdata<-merged_genus_rf[,RFmeta$SampleID] %>% t()
+  
+  fit<-randomForest(x=RFdata[subset(RFmeta, Dataset=="Training")$SampleID,],
+               y=subset(RFmeta, Dataset=="Training")$Group,
+               importance=TRUE
+  )
+  
+Importance[[i]]<-
+  fit$importance %>%
+    as.data.frame() %>%
+    rownames_to_column("Taxon") %>%
+    arrange(desc("MeanDecreaseGini")) %>%
+    mutate(Iteration=i) %>%
+    dplyr::select(Iteration, Taxon, everything()) %>%
+    as_tibble()
+  
+
+  for(Task in c("Training","Test","Jiang","Chen")){
+      tm<-predict(fit, newdata=RFdata[subset(RFmeta, Dataset==Task)$SampleID,], type="prob")[,2] %>%
+          prediction(., subset(RFmeta, Dataset==Task)$Group) %>%
+          performance(., "tpr","fpr")
+      ROCR_ROCs[[paste0(Task,"_", i)]]<-
+          tibble(Iteration=i, Task=Task, FPR=unlist(tm@x.values), TPR=unlist(tm@y.values))
+      #https://stackoverflow.com/questions/54642823/how-to-get-specific-tpr-from-a-sequence-of-fpr-in-r
+      pROC_ROCs[[paste0(Task,"_", i)]]<-
+        predict(fit, newdata=RFdata[subset(RFmeta, Dataset==Task)$SampleID,], type="prob")[,2] %>%
+        roc(subset(RFmeta, Dataset==Task)$Group, .) %>%
+        coords(., x=1-seq(0,1,0.02), input="specificity", ret = c("se", "sp")) %>%
+          tibble(Iteration=i, Task=Task, FPR=specificity, TPR=sensitivity) %>%
+          mutate(FPR=1-FPR)
+
+      tm<-predict(fit, newdata=RFdata[subset(RFmeta, Dataset==Task)$SampleID,], type="prob")[,2] %>%
+          prediction(., subset(RFmeta, Dataset==Task)$Group) %>%
+          performance(., "auc")
+      AUCs[[paste0(Task,"_", i)]]<-tibble(Iteration=i, Task=Task, AUC=tm@y.values[[1]])
+    
+  }
+}
+```
+
+Check class balance of sampled splits.
+
+```{r}
+bind_rows(splits) %>% filter(Dataset=="Training") %>% mutate(Ratio=Case/Control) %>% summarise_at("Ratio", lst(mean,median,min,max,sd))
+```
+
+```{r}
+bind_rows(ROCR_ROCs) %>%
+  filter(Task!="Training") %>%
+  ggplot(aes(x=FPR, y=TPR, color=Task, group=paste(Task, Iteration))) +
+  geom_abline(linetype="dashed", color="grey50") +
+  geom_line()
+ggsave("manuscript_figures/ROC_indiv.pdf", height=2, width=3, useDingbats=F)
+
+
+bind_rows(pROC_ROCs) %>%
+  filter(Task!="Training") %>%
+  ggplot(aes(x=FPR, y=TPR, fill=Task)) +
+  geom_abline(linetype="dashed", color="grey50") +
+  stat_summary(geom="ribbon", alpha=0.5, fun.data=mean_sd) +
+  stat_summary(geom="line", linetype="dashed")
+ggsave("manuscript_figures/ROC_ribbon.pdf", height=2, width=3, useDingbats=F)
+```
+
+
+AUC values and Importance Scores for inset:
+
+```{r}
+bind_rows(AUCs) %>% group_by(Task) %>% summarize(AUC_mean=mean(AUC), AUC_median=median(AUC), AUC_sd=sd(AUC), AUC_min=min(AUC), AUC_max=max(AUC)) %>% interactive_table()
+bind_rows(AUCs) %>% group_by(Task) %>% summarize(AUC_mean=mean(AUC), AUC_median=median(AUC), AUC_sd=sd(AUC), AUC_min=min(AUC), AUC_max=max(AUC)) %>% write_tsv("manuscript_figures/AUROCS.tsv")
+
+bind_rows(Importance) %>%
+  group_by(Taxon) %>%
+  summarize_at("MeanDecreaseGini", lst(mean,sd,median,min,max)) %>%
+  arrange(desc(mean)) %>%
+  interactive_table()
+```
+
+## Figure 6B. Importance vs Rank
+
+```{r}
+bind_rows(Importance) %>%
+  group_by(Taxon) %>%
+  summarize_at("MeanDecreaseGini", lst(mean,sd,median,min,max)) %>%
+  arrange(desc(mean)) %>%
+  mutate(Rank=1:nrow(.)) %>%
+  mutate(Taxon=factor(Taxon, levels=rev(Taxon))) %>%
+  ggplot(aes(x=Rank, y=mean, ymin=mean-sd, ymax=mean+sd)) +
+  geom_ribbon(fill="grey80") +
+  geom_line(linetype="dashed", color="grey20") +
+  #geom_errorbar(width=0) +
+  #geom_point() +
+  coord_flip() +
+  scale_x_reverse() +
+  ylab("Mean Decrease GINI (mean ± SD)")
+ggsave("manuscript_figures/Importance_all.pdf", height=2, width=2, useDingbats=F)
+```
+
+## Figure 6C. Importance vs Rank - top 20
+
+```{r}
+bind_rows(Importance) %>%
+  group_by(Taxon) %>%
+  summarize_at("MeanDecreaseGini", lst(mean,sd,median,min,max)) %>%
+  arrange(desc(mean)) %>%
+  mutate(Rank=1:nrow(.)) %>%
+  filter(Rank<20) %>%
+  mutate(Taxon=factor(Taxon, levels=rev(Taxon))) %>%
+  ggplot(aes(x=Taxon, y=mean, ymin=mean-sd, ymax=mean+sd)) +
+  geom_errorbar(width=0) +
+  geom_point() +
+  coord_flip()  +
+  ylab("Mean Decrease GINI (mean ± SD)")
+ggsave("manuscript_figures/Importance_top20.pdf", height=2, width=5, useDingbats=F)
+```
+
+***
+
